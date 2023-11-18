@@ -1,7 +1,7 @@
 # %%
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
-from transformer import DemoTransformer, Config
-from easy_transformer import EasyTransformer
+from transformer import DemoTransformer, DualTransformer, Config
+from transformer_lens import HookedTransformer
 import torch
 import pickle
 
@@ -47,7 +47,7 @@ def import_ablated_model(version, means):
 
 # %%
 def load_gpt2_weights():
-    reference_gpt2 = EasyTransformer.from_pretrained("gpt2-small", fold_ln=False, center_unembed=False, center_writing_weights=False)
+    reference_gpt2 = HookedTransformer.from_pretrained("gpt2-small", fold_ln=False, center_unembed=False, center_writing_weights=False, pad_token_id=tokenizer.eos_token_id)
     with open("models/gpt2_weights.pkl", "wb") as f:
         pickle.dump(reference_gpt2.state_dict(), f)
 
@@ -61,3 +61,12 @@ def load_demo_gpt2(means):
     demo_gpt2.cuda()
     return demo_gpt2
 
+# %%
+
+def load_dual_gpt2():
+    with open("models/gpt2_weights.pkl", "rb") as f:
+        gpt2_weights = pickle.load(f)
+    demo_gpt2 = DualTransformer(Config(debug=False))
+    demo_gpt2.load_state_dict(gpt2_weights, strict=False)
+    demo_gpt2.cuda()
+    return demo_gpt2

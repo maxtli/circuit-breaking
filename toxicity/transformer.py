@@ -12,8 +12,23 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
-from easy_transformer.utils import gelu_new
 import tqdm.auto as tqdm
+
+
+def gelu_new(
+    input
+):
+    # Implementation of GeLU used by GPT2 - subtly different from PyTorch's
+    return (
+        0.5
+        * input
+        * (
+            1.0
+            + torch.tanh(
+                np.sqrt(2.0 / np.pi) * (input + 0.044715 * torch.pow(input, 3.0))
+            )
+        )
+    )
 
 @dataclass
 class Config:
@@ -194,7 +209,12 @@ class TransformerBlock(nn.Module):
         # resid_pre [batch, position, d_model, prev_head_idx]
         masked_residuals = einsum("batch position prev_head_idx d_model, prev_head_idx n_heads -> batch position n_heads d_model", resid_pre, self.edge_mask_attentions)
         if isinstance(means, torch.Tensor):
-            masked_means = einsum("prev_head_idx d_model, prev_head_idx n_heads -> n_heads d_model", means[:self.edge_mask_attentions.shape[0]], 1 - self.edge_mask_attentions)
+            if means.dim() == 2:
+                means = means.unsqueeze(0,1)
+            
+            assert means.dim() == 4
+
+            masked_means = einsum("b p prev_head_idx d_model, prev_head_idx n_heads -> b p n_heads d_model", means, 1 - self.edge_mask_attentions)
             masked_residuals = masked_residuals + masked_means
 
         # print(self.edge_mask_attentions)
@@ -263,7 +283,7 @@ class DemoTransformer(nn.Module):
         
         for i, block in enumerate(self.blocks):
             # print(i)
-            residual = block(residual, self.means)
+            residual = block(residual, self.means[:block.edge_mask_attentions.shape[0]])
             # if hasattr(self,"saved_states"):
             #     self.saved_states = torch.cat((self.saved_states, block.saved_output.unsqueeze(0)), dim=0)
             # else:
@@ -279,6 +299,64 @@ class DemoTransformer(nn.Module):
         # with open("saved_states_new.pkl", "wb") as f:
         #     pickle.dump(self.saved_states, f)
         return [logits]
+    
+# %%
+
+class DualTransformer(nn.Module):
+    def __init__(self, cfg, init_mask=False):
+        super().__init__()
+        self.cfg = cfg
+        self.embed = Embed(cfg)
+        self.pos_embed = PosEmbed(cfg)
+        self.ln_final = LayerNorm(cfg)
+        self.unembed = Unembed(cfg)
+        for p in self.parameters():
+            p.requires_grad = False
+
+        self.blocks = nn.ModuleList([TransformerBlock(cfg, i) for i in range(cfg.n_layers)])
+        total_nodes = (cfg.n_heads + 1) * cfg.n_layers + 1
+
+        if init_mask is False:
+            init_mask = torch.ones((total_nodes,))
+        self.output_mask = torch.nn.Parameter(init_mask, requires_grad=True)
+    
+    def forward(self, tokens, corr_tokens, return_states=False):
+        # tokens [batch, position]
+        embed = self.embed(tokens)
+        pos_embed = self.pos_embed(tokens)
+
+        residual = embed + pos_embed
+        residual = einops.rearrange(residual, "batch position d_model -> batch position 1 d_model")
+        
+        corr_embed = self.embed(corr_tokens)
+        corr_pos_embed = self.pos_embed(corr_tokens)
+        
+        corr_residual = corr_embed + corr_pos_embed
+        corr_residual = einops.rearrange(corr_residual, "batch position d_model -> batch position 1 d_model")
+
+        for i, block in enumerate(self.blocks):
+            # print(i)
+            residual = block(residual, corr_residual)
+            corr_residual = block(corr_residual, False)
+            # if hasattr(self,"saved_states"):
+            #     self.saved_states = torch.cat((self.saved_states, block.saved_output.unsqueeze(0)), dim=0)
+            # else:
+            #     self.saved_states = block.saved_output.unsqueeze(0)
+        
+        if return_states:
+            return residual
+        
+        residual = einsum("batch position prev_head_idx d_model, prev_head_idx -> batch position d_model", residual, self.output_mask)
+        normalized_resid_final = self.ln_final(residual)
+        logits = self.unembed(normalized_resid_final)
+
+        corr_normalized_resid_final = self.ln_final(corr_residual.sum(dim=2))
+        corr_logits = self.unembed(corr_normalized_resid_final)
+        # logits have shape [batch, position, logits]
+        # with open("saved_states_new.pkl", "wb") as f:
+        #     pickle.dump(self.saved_states, f)
+        return [logits, corr_logits]
+
 
 # %%
 
